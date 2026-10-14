@@ -84,8 +84,9 @@ Rectangle {
             context.closePath();
             context.stroke();
 
-            // The x inside.
-            var cx = notch + (w - notch) / 2;
+            // The x inside, nudged left of the body's center so the tapered
+            // tip doesn't make it read as off-center.
+            var cx = notch + (w - notch) * 0.435;
             var cy = h / 2;
             var arm = h * 0.18;
             context.beginPath();

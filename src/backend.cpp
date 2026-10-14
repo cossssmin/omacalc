@@ -6,19 +6,39 @@
 #include <QFile>
 #include <QGuiApplication>
 #include <QLocale>
-#include <QRect>
 #include <QSettings>
 #include <QTextStream>
 #include <QVariantMap>
 #include <cmath>
 
 namespace {
-const auto windowGeometrySetting = QStringLiteral("window/geometry");
-
 const QString plusSign = QStringLiteral("+");
 const QString minusSign = QStringLiteral("−");
 const QString multiplySign = QStringLiteral("×");
 const QString divideSign = QStringLiteral("÷");
+
+// A leading # is a bare hex color rather than a comment.
+QString withoutTomlComment(const QString &text) {
+    const QString value = text.trimmed();
+    QChar quote;
+    bool escaped = false;
+    for (int i = 0; i < value.size(); ++i) {
+        const QChar character = value.at(i);
+        if (escaped) {
+            escaped = false;
+        } else if (quote == QLatin1Char('"') && character == QLatin1Char('\\')) {
+            escaped = true;
+        } else if (!quote.isNull() && character == quote) {
+            quote = QChar();
+        } else if (quote.isNull() && (character == QLatin1Char('"')
+                                      || character == QLatin1Char('\''))) {
+            quote = character;
+        } else if (quote.isNull() && character == QLatin1Char('#') && i > 0) {
+            return value.left(i).trimmed();
+        }
+    }
+    return value.trimmed();
+}
 
 bool isOperator(const QString &token) {
     return token == plusSign || token == minusSign
@@ -38,6 +58,10 @@ QString sealNumber(const QString &entry) {
 }
 
 Backend::Backend(QObject *parent) : QObject(parent) {
+    // Older builds stored the compositor's size. On Hyprland 0.56 that size
+    // was the tiled or maximized rectangle, and the maximized flag was set for
+    // a normal window, so the next launch filled the screen. Drop both keys.
+    discardSavedWindowGeometry();
     loadOmarchyTheme();
     watchOmarchyTheme();
     connect(&m_themeWatcher, &QFileSystemWatcher::fileChanged, this, [this]() {
@@ -393,26 +417,29 @@ void Backend::pasteNumber() {
     emit calculationChanged();
 }
 
-QVariantMap Backend::windowGeometry() const {
-    const QSettings settings;
-    const QRect geometry = settings.value(windowGeometrySetting).toRect();
-    QVariantMap map;
-    // Positions can legitimately be negative on monitors left of or above the
-    // primary, so validity travels separately instead of being encoded as -1.
-    map.insert(QStringLiteral("valid"), geometry.isValid());
-    map.insert(QStringLiteral("x"), geometry.x());
-    map.insert(QStringLiteral("y"), geometry.y());
-    map.insert(QStringLiteral("width"), geometry.width());
-    map.insert(QStringLiteral("height"), geometry.height());
-    map.insert(QStringLiteral("maximized"),
-               settings.value(QStringLiteral("window/maximized"), false).toBool());
-    return map;
+QVariantMap Backend::defaultWindowSize() const {
+    qreal scale = m_textScale;
+    if (!std::isfinite(scale) || scale <= 0)
+        scale = 1.0;
+
+    // 400×568 is the v0.2.2 design size. The minimum matches Main.qml, so a
+    // text scale below 1 still opens at a usable calculator.
+    QVariantMap size;
+    size.insert(QStringLiteral("width"), qMax(300, qRound(400 * scale)));
+    size.insert(QStringLiteral("height"), qMax(430, qRound(568 * scale)));
+    return size;
 }
 
-void Backend::saveWindowGeometry(int x, int y, int width, int height, bool maximized) {
+void Backend::discardSavedWindowGeometry() {
     QSettings settings;
-    settings.setValue(windowGeometrySetting, QRect(x, y, width, height));
-    settings.setValue(QStringLiteral("window/maximized"), maximized);
+    const bool hadGeometry = settings.contains(QStringLiteral("window/geometry"));
+    const bool hadMaximized = settings.contains(QStringLiteral("window/maximized"));
+    if (!hadGeometry && !hadMaximized)
+        return;
+
+    settings.remove(QStringLiteral("window/geometry"));
+    settings.remove(QStringLiteral("window/maximized"));
+    settings.sync();
 }
 
 void Backend::setDarkMode(bool darkMode) {
@@ -433,14 +460,13 @@ void Backend::setTextScale(qreal textScale) {
 }
 
 void Backend::loadOmarchyTheme() {
-    m_themeBackground = m_darkMode ? QStringLiteral("#101010") : QStringLiteral("#ffffff");
-    m_themeForeground = m_darkMode ? QStringLiteral("#eeeeee") : QStringLiteral("#222324");
-    m_themeAccent = m_darkMode ? QStringLiteral("#5584aa") : QStringLiteral("#2077b2");
-    m_themeSelection = m_darkMode ? QStringLiteral("#186a9a") : QStringLiteral("#2077b2");
-
     const QString colorsPath = QDir::homePath()
         + QStringLiteral("/.local/state/omarchy/current/theme/colors.toml");
     QString themeMode;
+    QString themeBackground;
+    QString themeForeground;
+    QString themeAccent;
+    QString themeSelection;
     QFile file(colorsPath);
     if (file.open(QIODevice::ReadOnly | QIODevice::Text)) {
         QTextStream in(&file);
@@ -454,7 +480,7 @@ void Backend::loadOmarchyTheme() {
                 continue;
 
             const QString key = line.left(equals).trimmed();
-            QString value = line.mid(equals + 1).trimmed();
+            QString value = withoutTomlComment(line.mid(equals + 1));
             if (value.size() >= 2
                     && ((value.front() == QLatin1Char('"') && value.back() == QLatin1Char('"'))
                         || (value.front() == QLatin1Char('\'') && value.back() == QLatin1Char('\''))))
@@ -462,14 +488,14 @@ void Backend::loadOmarchyTheme() {
 
             if (key == QStringLiteral("mode"))
                 themeMode = value;
-            else if (key == QStringLiteral("background"))
-                m_themeBackground = value;
-            else if (key == QStringLiteral("foreground"))
-                m_themeForeground = value;
-            else if (key == QStringLiteral("accent"))
-                m_themeAccent = value;
-            else if (key == QStringLiteral("selection"))
-                m_themeSelection = value;
+            else if (key == QStringLiteral("background") && QColor(value).isValid())
+                themeBackground = value;
+            else if (key == QStringLiteral("foreground") && QColor(value).isValid())
+                themeForeground = value;
+            else if (key == QStringLiteral("accent") && QColor(value).isValid())
+                themeAccent = value;
+            else if (key == QStringLiteral("selection") && QColor(value).isValid())
+                themeSelection = value;
         }
     }
 
@@ -482,7 +508,7 @@ void Backend::loadOmarchyTheme() {
         themeIsDark = false;
         themeModeKnown = true;
     } else {
-        const QColor background(m_themeBackground);
+        const QColor background(themeBackground);
         if (background.isValid()) {
             const double luminance = 0.299 * background.redF()
                 + 0.587 * background.greenF() + 0.114 * background.blueF();
@@ -494,6 +520,15 @@ void Backend::loadOmarchyTheme() {
         m_darkMode = themeIsDark;
         emit darkModeChanged();
     }
+
+    m_themeBackground = themeBackground.isEmpty()
+        ? (m_darkMode ? QStringLiteral("#101010") : QStringLiteral("#ffffff")) : themeBackground;
+    m_themeForeground = themeForeground.isEmpty()
+        ? (m_darkMode ? QStringLiteral("#eeeeee") : QStringLiteral("#222324")) : themeForeground;
+    m_themeAccent = themeAccent.isEmpty()
+        ? (m_darkMode ? QStringLiteral("#5584aa") : QStringLiteral("#2077b2")) : themeAccent;
+    m_themeSelection = themeSelection.isEmpty()
+        ? (m_darkMode ? QStringLiteral("#186a9a") : QStringLiteral("#2077b2")) : themeSelection;
 
     emit themeColorsChanged();
 }
